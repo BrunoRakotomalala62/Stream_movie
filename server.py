@@ -5,6 +5,7 @@ Routes:
   GET /recherche?film=<query>&uid=<user_id>  - Search movies
   GET /stream?film=<index>&uid=<user_id>     - Get download/stream URL
   GET /detail?film=<index>&uid=<user_id>     - Get movie details
+  GET /download?film=<index>&uid=<user_id>   - Redirect to direct MP4 download
 """
 
 import hashlib
@@ -12,7 +13,7 @@ import time
 import json
 import os
 import logging
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 import requests
 
 app = Flask(__name__)
@@ -66,21 +67,33 @@ def generate_client_token():
     return f"{ts},{md5_hash}"
 
 
-def create_authenticated_session():
+def create_authenticated_session(detail_path=None):
     """Create an authenticated session with the MovieBox API.
     
     The flow:
     1. Generate a client token
     2. Make a GET request to everyone-search to obtain a cookie token
     3. Use the cookie token for subsequent POST requests
+    
+    Args:
+        detail_path: Optional detail path to use as Referer (e.g., 'the-young-master-yHzyTiIxYF')
+    
+    ⚠️ CRITICAL: Le Referer doit pointer vers la page du film pour que
+    les endpoints play/download renvoient les vraies URLs de streaming.
+    Sans ça, l'API retourne des streams/downloads vides (anti-leeching).
     """
     session = requests.Session()
     
     token = generate_client_token()
     
+    # Construire le Referer : page du film si dispo, sinon homepage
+    referer_url = f'{ORIGIN}/'
+    if detail_path:
+        referer_url = f'{ORIGIN}/en/movies/{detail_path}'
+    
     headers = {
         'Origin': ORIGIN,
-        'Referer': f'{ORIGIN}/',
+        'Referer': referer_url,
         'Content-Type': 'application/json',
         'Accept': 'application/json',
         'X-Request-Lang': 'en',
@@ -215,7 +228,7 @@ def recherche():
     
     logger.info(f"Search: film='{film}', uid={uid}")
     
-    # Authenticate
+    # Authenticate (pas besoin de detail_path pour la recherche)
     session, headers = create_authenticated_session()
     
     # Search
@@ -315,8 +328,14 @@ def stream():
     movie = cached[film_index - 1]
     logger.info(f"Stream request: uid={uid}, index={film_index}, movie={movie['title']}")
     
-    # Authenticate
-    session, headers = create_authenticated_session()
+    # ⚠️ Authenticate avec le detail_path pour que le Referer corresponde
+    # à la page du film — sans ça, l'API retourne des streams vides !
+    session, headers = create_authenticated_session(movie['detailPath'])
+    
+    # ⚠️ Re-set le Referer pour chaque appel play/download car c'est 
+    # ce qui détermine si le serveur retourne les vraies URLs ou non
+    movie_referer = f"{ORIGIN}/en/movies/{movie['detailPath']}"
+    headers['Referer'] = movie_referer
     
     # Get stream data
     stream_data = get_stream_data(
@@ -387,11 +406,83 @@ def stream():
             "cover_url": subject.get('cover', {}).get('url', ''),
         }
     
-    # Also provide direct download link format from MovieBox
-    # The site constructs: /wefeed-h5api-bff/subject/download?subjectId=X
-    response['direct_download_url'] = f"{API_BASE}/wefeed-h5api-bff/subject/download?subjectId={movie['subjectId']}"
+    # Get the first usable stream/download URL
+    best_url = None
+    if response['streams']:
+        best_url = response['streams'][0].get('url')
+    elif response['downloads']:
+        best_url = response['downloads'][0].get('url')
+    
+    response['direct_url'] = best_url
+    response['message'] = "URL de téléchargement direct prête" if best_url else "Aucune URL directe disponible (le film nécessite peut-être un abonnement)"
     
     return jsonify(response), 200
+
+
+@app.route('/download', methods=['GET'])
+def download():
+    """
+    Redirect to the direct download URL for immediate téléchargement.
+    
+    Query params:
+        film (required): Index from search results (1, 2, 3, ...)
+        uid  (required): User ID to retrieve cached search results
+    
+    Returns: HTTP 302 redirect to the MP4 file, or JSON error.
+    """
+    film_index = request.args.get('film', '').strip()
+    uid = request.args.get('uid', '').strip()
+    
+    if not film_index:
+        return jsonify({"error": "Paramètre 'film' requis. Ex: /download?film=1&uid=123"}), 400
+    if not uid:
+        return jsonify({"error": "Paramètre 'uid' requis"}), 400
+    
+    try:
+        film_index = int(film_index)
+    except ValueError:
+        return jsonify({"error": "'film' doit être un nombre (1, 2, 3...)"}), 400
+    
+    if uid not in search_cache:
+        return jsonify({"error": "Aucune recherche en cache. Faites d'abord /recherche"}), 404
+    
+    cached = search_cache[uid]['results']
+    if film_index < 1 or film_index > len(cached):
+        return jsonify({"error": f"Index invalide. Choisissez entre 1 et {len(cached)}"}), 400
+    
+    movie = cached[film_index - 1]
+    logger.info(f"Download redirect: uid={uid}, index={film_index}, movie={movie['title']}")
+    
+    session, headers = create_authenticated_session(movie['detailPath'])
+    movie_referer = f"{ORIGIN}/en/movies/{movie['detailPath']}"
+    headers['Referer'] = movie_referer
+    
+    # Try play first (streams), then download
+    stream_data = get_stream_data(session, headers, movie['subjectId'], movie['detailPath'])
+    download_data = get_download_data(session, headers, movie['subjectId'])
+    
+    # Find the best URL
+    url = None
+    if stream_data and stream_data.get('code') == 0:
+        streams = stream_data.get('data', {}).get('streams', [])
+        if streams:
+            url = streams[0].get('url')
+    
+    if not url and download_data and download_data.get('code') == 0:
+        downloads = download_data.get('data', {}).get('downloads', [])
+        if downloads:
+            url = downloads[0].get('url')
+    
+    if not url:
+        return jsonify({
+            "error": "Aucune URL de téléchargement disponible",
+            "detail": "Le film nécessite peut-être un abonnement VIP ou les serveurs sont inaccessibles"
+        }), 404
+    
+    logger.info(f"Redirecting to: {url[:80]}...")
+    
+    # Redirect to the direct MP4 URL
+    return redirect(url, code=302)
 
 
 @app.route('/detail', methods=['GET'])
@@ -430,7 +521,11 @@ def detail():
     movie = cached[film_index - 1]
     logger.info(f"Detail request: uid={uid}, index={film_index}, movie={movie['title']}")
     
-    session, headers = create_authenticated_session()
+    session, headers = create_authenticated_session(movie['detailPath'])
+    
+    movie_referer = f"{ORIGIN}/en/movies/{movie['detailPath']}"
+    headers['Referer'] = movie_referer
+    
     detail_data = get_movie_detail(session, headers, movie['subjectId'])
     
     if not detail_data or detail_data.get('code') != 0:
@@ -487,12 +582,17 @@ def index():
             },
             "GET /stream": {
                 "params": "?film=<index>&uid=<user_id>",
-                "description": "Obtenir les URLs de streaming/téléchargement par index",
+                "description": "Obtenir les URLs de streaming/téléchargement",
                 "example": "/stream?film=1&uid=123"
+            },
+            "GET /download": {
+                "params": "?film=<index>&uid=<user_id>",
+                "description": "Redirection directe vers le fichier MP4",
+                "example": "/download?film=1&uid=123"
             },
             "GET /detail": {
                 "params": "?film=<index>&uid=<user_id>",
-                "description": "Obtenir les détails complets d'un film par index",
+                "description": "Détails complets d'un film",
                 "example": "/detail?film=1&uid=123"
             },
             "GET /health": {
@@ -500,9 +600,9 @@ def index():
             }
         },
         "workflow": [
-            "1. GET /recherche?film=Jackie+Chan&uid=monTel → retourne les résultats avec index",
-            "2. GET /stream?film=1&uid=monTel → retourne les URLs de streaming pour le résultat #1",
-            "3. GET /stream?film=2&uid=monTel → streaming pour le résultat #2, etc."
+            "1. GET /recherche?film=Jackie+Chan&uid=monTel → résultats avec index",
+            "2. GET /download?film=1&uid=monTel → redirection vers le MP4 (téléchargement direct)",
+            "3. GET /stream?film=1&uid=monTel → détails complets + URL"
         ]
     }), 200
 
