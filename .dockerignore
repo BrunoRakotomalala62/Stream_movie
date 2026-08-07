@@ -1,0 +1,41 @@
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual env
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cache (sera recréé par l'app)
+cache/*.json
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Environnement
+.env
+.env.local
